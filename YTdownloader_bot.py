@@ -1,0 +1,252 @@
+import os
+import asyncio
+import subprocess
+from aiogram import Bot, Dispatcher, types, F, Router
+from aiogram.types import InputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from yt_dlp import YoutubeDL
+import re
+
+# --- Настройки ---
+TOKEN = "TG_TOKEN"
+TEMP_DIR = "downloads"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+router = Router()
+
+# --- Проверка FFmpeg ---
+def check_ffmpeg():
+    """Проверяет доступность FFmpeg"""
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+has_ffmpeg = check_ffmpeg()
+print(f"FFmpeg доступен: {has_ffmpeg}")
+
+# --- Опции yt-dlp для Ubuntu с FFmpeg ---
+def get_ydl_opts(audio=False):
+    """Возвращает опции для yt-dlp"""
+
+    base_opts = {
+        "outtmpl": f"{TEMP_DIR}/%(title)s.%(ext)s",
+        "noplaylist": True,
+        "quiet": True,
+        "ffmpeg_location": "/usr/bin/ffmpeg",
+    }
+
+    if audio:
+        return {
+            **base_opts,
+            "format": "bestaudio/best",
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192"
+            }],
+        }
+    else:
+        return {
+            **base_opts,
+            "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+            "merge_output_format": "mp4",
+        }
+
+def get_ydl_opts_safe(audio=False):
+    """Более безопасные опции"""
+
+    base_opts = {
+        "outtmpl": f"{TEMP_DIR}/%(title)s.%(ext)s",
+        "noplaylist": True,
+        "quiet": True,
+        "ffmpeg_location": "/usr/bin/ffmpeg",
+        "ignoreerrors": True,
+    }
+
+    if audio:
+        return {
+            **base_opts,
+            "format": "bestaudio",
+        }
+    else:
+        return {
+            **base_opts,
+            "format": "best[ext=mp4]/best[height<=720]/best",
+        }
+
+user_links = {}
+
+def is_youtube_url(url: str) -> bool:
+    """Проверяет, является ли строка YouTube ссылкой"""
+    youtube_regex = (
+        r'(https?://)?(www\.)?'
+        r'(youtube|youtu|youtube-nocookie)\.(com|be)/'
+        r'(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})')
+    return re.match(youtube_regex, url) is not None
+
+async def download_video(url: str, audio: bool = False) -> str:
+    """Скачивает видео/аудио и возвращает путь к файлу"""
+
+    opts_list = [get_ydl_opts(audio), get_ydl_opts_safe(audio)]
+    last_error = None
+
+    for i, opts in enumerate(opts_list):
+        try:
+            print(f"Попытка {i+1} с опциями: {opts.get('format', 'default')}")
+
+            def _download():
+                with YoutubeDL(opts) as ydl:
+                    def progress_hook(d):
+                        if d['status'] == 'downloading':
+                            print(f"Скачивание: {d.get('_percent_str', 'N/A')}")
+                        elif d['status'] == 'finished':
+                            print("Скачивание завершено")
+
+                    ydl.add_progress_hook(progress_hook)
+
+                    info = ydl.extract_info(url, download=True)
+                    filename = ydl.prepare_filename(info)
+
+                    if audio:
+                        filename = os.path.splitext(filename)[0] + ".mp3"
+
+                    print(f"Файл готов: {filename}")
+                    return filename
+
+            filename = await asyncio.to_thread(_download)
+
+            if os.path.exists(filename) and os.path.getsize(filename) > 0:
+                return filename
+            else:
+                raise Exception("Файл не был создан")
+
+        except Exception as e:
+            last_error = e
+            print(f"Ошибка при попытке {i+1}: {e}")
+            continue
+
+    raise Exception(f"Все попытки скачивания провалились: {last_error}")
+# --- Хэндлеры ---
+@router.message(Command("start"))
+async def start(message: types.Message):
+    await message.answer(
+        "Привет! Я YouTube downloader бот. 🎥🎵\n\n"
+        "Отправь мне ссылку на YouTube видео, и я скачаю его для тебя.\n"
+        f"Статус FFmpeg: {'✅ установлен' if has_ffmpeg else '❌ не установлен'}"
+    )
+
+@router.message(F.text)
+async def handle_link(message: types.Message):
+    url = message.text.strip()
+
+    if not is_youtube_url(url):
+        await message.answer("❌ Пожалуйста, отправьте корректную ссылку на YouTube видео.")
+        return
+
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+
+    user_links[message.from_user.id] = url
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🎥 Видео (MP4)", callback_data="format_video"),
+            InlineKeyboardButton(text="🎵 Аудио (MP3)", callback_data="format_audio")
+        ]
+    ])
+
+    await message.answer("Выберите формат для скачивания:", reply_markup=kb)
+
+@router.callback_query(F.data.in_(["format_video", "format_audio"]))
+async def handle_format(callback: types.CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+
+    if user_id not in user_links:
+        await callback.message.answer("❌ Ссылка не найдена, отправьте её снова.")
+        return
+
+    url = user_links[user_id]
+    audio = callback.data == "format_audio"
+    format_type = "аудио" if audio else "видео"
+
+    filename = None
+
+    try:
+        await callback.message.delete()
+        status_msg = await callback.message.answer(f"⏳ Скачиваю {format_type}...")
+
+        filename = await download_video(url, audio)
+
+        # Проверяем размер файла
+        file_size = os.path.getsize(filename)
+        max_size = 50 * 1024 * 1024  # 50MB
+
+        if file_size > max_size:
+            await status_msg.edit_text(
+                f"❌ Файл слишком большой ({file_size // (1024*1024)}MB). "
+                f"Максимальный размер: 50MB"
+            )
+            if filename and os.path.exists(filename):
+                os.remove(filename)
+            return
+
+        await status_msg.edit_text("📤 Отправляю файл...")
+
+        # ПРАВИЛЬНОЕ использование InputFile в aiogram 3.x
+        # Просто передаем путь к файлу или используем менеджер контекста
+        if audio:
+            # Для аудио - используем менеджер контекста
+            with open(filename, 'rb') as audio_file:
+                await callback.message.answer_audio(
+                    audio=types.BufferedInputFile(
+                        audio_file.read(),
+                        filename=os.path.basename(filename)
+                    ),
+                    caption="🎵 Аудио готово!"
+                )
+        else:
+            # Для видео - используем прямой путь (InputFile сам обработает)
+            await callback.message.answer_video(
+                video=types.FSInputFile(filename),
+                caption="🎥 Видео готово!"
+            )
+
+        await status_msg.delete()
+
+    except Exception as e:
+        error_msg = f"❌ Ошибка при скачивании: {str(e)}"
+        print(f"Критическая ошибка: {e}")
+
+        if "aborting due to --abort-on-error" in str(e).lower():
+            error_msg = (
+                "❌ Ошибка объединения потоков. \n\n"
+                "Попробуйте другой формат или ссылку."
+            )
+
+        try:
+            await status_msg.edit_text(error_msg)
+        except:
+            await callback.message.answer(error_msg)
+    finally:
+        user_links.pop(user_id, None)
+        if filename and os.path.exists(filename):
+            try:
+                os.remove(filename)
+            except Exception as e:
+                print(f"Ошибка при удалении файла: {e}")
+
+dp.include_router(router)
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    print("Бот запущен...")
+    print(f"FFmpeg доступен: {has_ffmpeg}")
+    asyncio.run(main())
+
